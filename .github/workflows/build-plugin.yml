@@ -36,7 +36,7 @@ jobs:
       - name: 解析 SDK 标签与资产
         shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # gh 命令行会自动读取此变量
           ARCH: ${{ github.event.inputs.architecture }}
           SDK_REPO: "xcz-ns/LEDE"
         run: |
@@ -45,22 +45,20 @@ jobs:
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
           echo "SDK_REPO=$SDK_REPO" >> "$GITHUB_ENV"
           
-          AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
-          resp=$(curl -fsSL --retry 3 "${AUTH[@]}" "https://api.github.com/repos/${SDK_REPO}/releases?per_page=100")
+          # 使用原生 gh cli 获取包含指定后缀的 release 列表
+          TAGS=$(gh release list -R "$SDK_REPO" -L 100 --json tagName -q '.[].tagName | select(endswith("'"$ARCH"'"))')
+          [[ -z "$TAGS" ]] && { echo "::error::未找到以 ${ARCH} 结尾的 release 标签"; exit 1; }
           
-          tags=$(echo "$resp" | jq -r --arg a "${ARCH}" '[.[] | select(.tag_name | endswith($a)) | .tag_name] | .[]')
-          [[ -z "$tags" ]] && { echo "::error::未找到以 ${ARCH} 结尾的 release 标签"; exit 1; }
-          
-          while IFS= read -r tag; do
-            [[ -z "$tag" ]] && continue
-            asset=$(curl -fsSL --retry 3 "${AUTH[@]}" "https://api.github.com/repos/${SDK_REPO}/releases/tags/${tag}" \
-              | jq -r '.assets[] | select(.name | test("^openwrt-sdk.*\\.tar\\.xz$")) | .name' | head -n1) || continue
-            if [[ -n "$asset" ]]; then
-              echo "SDK_TAG=${tag}" >> "$GITHUB_ENV"
-              echo "SDK_ASSET=${asset}" >> "$GITHUB_ENV"
+          for tag in $TAGS; do
+            # 获取该 release 下特定的 tar.xz 文件
+            ASSET=$(gh release view "$tag" -R "$SDK_REPO" --json assets -q '.assets[].name | select(test("^openwrt-sdk.*\\.tar\\.xz$"))' | head -n1 || true)
+            if [[ -n "$ASSET" ]]; then
+              echo "SDK_TAG=$tag" >> "$GITHUB_ENV"
+              echo "SDK_ASSET=$ASSET" >> "$GITHUB_ENV"
               exit 0
             fi
-          done <<< "$tags"
+          done
+          
           echo "::error::所选架构未找到 openwrt-sdk 资产"
           exit 1
 
@@ -79,11 +77,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          REPO_NORM="${{ github.event.inputs.firmware_repo }}"
-          REPO_NORM="${REPO_NORM#git@github.com:}"
-          REPO_NORM="${REPO_NORM#https://github.com/}"
-          REPO_NORM="${REPO_NORM%.git}"
-          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}" firmware
+          # 一行正则提取 user/repo 格式，兼容各种输入形式
+          REPO_NORM=$(echo "${{ github.event.inputs.firmware_repo }}" | sed -E 's|.*github\.com[:/]?([^/]+/[^/.]+)(\.git)?|\1|')
+          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}.git" firmware
           
           echo "src-link custom ${GITHUB_WORKSPACE}/firmware" >> "${SDK_DIR}/feeds.conf.default"
           sed -i 's|^\(src-git luci \).*|\1https://github.com/coolsnowwolf/luci.git;master|' "${SDK_DIR}/feeds.conf.default"
@@ -124,23 +120,14 @@ jobs:
           for name in "${PLUGINS[@]}"; do
             [[ -z "$name" ]] && continue
             
-            # 清理其他feed中的同名冲突
+            # 使用官方脚本处理冲突，卸载同名插件并强制指定从 custom 源安装
             if [[ -d "feeds/custom/${name}" && ! -e "package/feeds/custom/${name}" ]]; then
-              OTHER=$(find feeds -mindepth 2 -type d -name "${name}" -not -path 'feeds/custom*' -not -path '*/.git*' 2>/dev/null || true)
-              if [[ -n "$OTHER" ]]; then
-                for d in $OTHER; do rm -rf "$d" "package/feeds/${d#feeds/}"; done
-                ./scripts/feeds install -a -p custom || true
-              fi
+              ./scripts/feeds uninstall "${name}" || true
+              ./scripts/feeds install -p custom "${name}" || true
             fi
             
-            # 查找目标插件路径
-            TARGET=""
-            if [[ -d "package/feeds/custom/${name}" ]]; then
-              TARGET="package/feeds/custom/${name}"
-            else
-              TARGET=$(find package/feeds -type d -name "${name}" -not -path '*/.git/*' 2>/dev/null | head -n1 || true)
-              [[ -z "$TARGET" && -d "package/${name}" ]] && TARGET="package/${name}"
-            fi
+            # 由于 feeds install 会产生软链，直接在 package 下查找即可
+            TARGET=$(find package -type d -name "${name}" -not -path '*/.git*' | head -n1 || true)
             
             if [[ -z "$TARGET" || ! -f "${TARGET}/Makefile" ]]; then
               MISSING="${MISSING} ${name}"
@@ -174,14 +161,11 @@ jobs:
           REPO=${{ github.repository }}
           echo "==== 开始清理 $REPO 的历史记录 ===="
           
-          # 1. 删除所有失败和被取消的记录
-          echo "正在清理 失败/取消 的记录..."
+          # 使用 gh api 结合 xargs 并发清理记录
           gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .id' | \
           xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
           
-          # 2. 删除3天前的成功记录
           CUTOFF=$(date -d "3 days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
-          echo "正在清理 $CUTOFF 之前的成功记录..."
           gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="success" and .created_at < "'$CUTOFF'") | .id' | \
           xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
           
