@@ -26,8 +26,6 @@ permissions:
   contents: read
   actions: write
 
-# 【已按方案B删除 concurrency 块，任务不再排队，支持同时运行】
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -104,9 +102,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "${SDK_DIR}"
-          ./scripts/feeds update -a || ./scripts/feeds update -a
-          # 这里不再需要 install -p custom，因为我们已经把代码直插到 package 目录了
-          ./scripts/feeds install -a || true
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
       # ==================== 步骤5：配置与下载 ====================
       - name: 生成配置并预下载依赖
@@ -119,7 +116,7 @@ jobs:
             sed -i 's/ +SELINUX:busybox-selinux +!SELINUX:busybox//g' package/base-files/Makefile
             make defconfig > /tmp/defconfig.log 2>&1
           fi
-          make download -j"$(nproc)" V=s || true
+          make download -j"$(nproc)"
 
       # ==================== 步骤6：编译插件 ====================
       - name: 编译插件
