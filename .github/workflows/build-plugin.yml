@@ -109,15 +109,6 @@ jobs:
           cd "${SDK_DIR}"
           make defconfig
           
-          echo "=> 屏蔽不需要的 apk 包，防止下载报错..."
-          # 1. 从 feeds 软链中强行卸载 apk
-          ./scripts/feeds uninstall apk || true
-          # 2. 将 .config 配置文件中所有选中 apk 的选项改为不选中
-          sed -i 's/CONFIG_PACKAGE_apk=y/# CONFIG_PACKAGE_apk is not set/g' .config
-          sed -i 's/CONFIG_PACKAGE_apk-openssl=y/# CONFIG_PACKAGE_apk-openssl is not set/g' .config
-          sed -i 's/CONFIG_PACKAGE_apk-mbedtls=y/# CONFIG_PACKAGE_apk-mbedtls is not set/g' .config
-          
-
       # ==================== 步骤6：编译插件 ====================
       - name: 🛠️ 启动目标插件编译
         shell: bash
