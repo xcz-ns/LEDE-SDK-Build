@@ -1,0 +1,5 @@
+# 构建中间产物
+sdk.tar.xz
+openwrt-sdk-*/
+firmware/
+artifacts/

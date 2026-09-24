@@ -1,0 +1,188 @@
+name: SDK 编译插件
+
+on:
+  workflow_dispatch:
+    inputs:
+      firmware_repo:
+        description: "插件源码仓库地址"
+        required: true
+        type: string
+        default: ""
+      architecture:
+        description: "选择目标架构"
+        required: true
+        type: choice
+        options:
+          - LEDE_Cudy
+          - LEDE_R3S
+          - LEDE_x86
+      plugin_name:
+        description: "插件包（空格连接）"
+        required: true
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ==================== 步骤1：解析 SDK ====================
+      - name: 解析 SDK 标签与资产
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCH: ${{ github.event.inputs.architecture }}
+          SDK_REPO: "xcz-ns/LEDE"
+        run: |
+          set -euo pipefail
+          ARTIFACT_NAME=$(printf '%s' "${{ github.event.inputs.plugin_name }}" | tr -c 'A-Za-z0-9._-' '-')
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+          echo "SDK_REPO=$SDK_REPO" >> "$GITHUB_ENV"
+          
+          AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json")
+          resp=$(curl -fsSL --retry 3 "${AUTH[@]}" "https://api.github.com/repos/${SDK_REPO}/releases?per_page=100")
+          
+          tags=$(echo "$resp" | jq -r --arg a "${ARCH}" '[.[] | select(.tag_name | endswith($a)) | .tag_name] | .[]')
+          [[ -z "$tags" ]] && { echo "::error::未找到以 ${ARCH} 结尾的 release 标签"; exit 1; }
+          
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            asset=$(curl -fsSL --retry 3 "${AUTH[@]}" "https://api.github.com/repos/${SDK_REPO}/releases/tags/${tag}" \
+              | jq -r '.assets[] | select(.name | test("^openwrt-sdk.*\\.tar\\.xz$")) | .name' | head -n1) || continue
+            if [[ -n "$asset" ]]; then
+              echo "SDK_TAG=${tag}" >> "$GITHUB_ENV"
+              echo "SDK_ASSET=${asset}" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done <<< "$tags"
+          echo "::error::所选架构未找到 openwrt-sdk 资产"
+          exit 1
+
+      # ==================== 步骤2：下载解压 SDK ====================
+      - name: 下载并解压 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/${SDK_REPO}/releases/download/${SDK_TAG}/${SDK_ASSET}"
+          curl -fL --retry 3 --retry-delay 5 -sS -o sdk.tar.xz "${url}"
+          tar -xJf sdk.tar.xz
+          echo "SDK_DIR=$(ls -d openwrt-sdk-* | head -n1)" >> "$GITHUB_ENV"
+
+      # ==================== 步骤3：配置插件源 ====================
+      - name: 注册 custom feed
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_NORM="${{ github.event.inputs.firmware_repo }}"
+          REPO_NORM="${REPO_NORM#git@github.com:}"
+          REPO_NORM="${REPO_NORM#https://github.com/}"
+          REPO_NORM="${REPO_NORM%.git}"
+          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}" firmware
+          
+          echo "src-link custom ${GITHUB_WORKSPACE}/firmware" >> "${SDK_DIR}/feeds.conf.default"
+          sed -i 's|^\(src-git luci \).*|\1https://github.com/coolsnowwolf/luci.git;master|' "${SDK_DIR}/feeds.conf.default"
+
+      # ==================== 步骤4：安装 feeds ====================
+      - name: 更新并安装 feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${SDK_DIR}"
+          ./scripts/feeds update -a || ./scripts/feeds update -a
+          ./scripts/feeds install -a -p custom || true
+          ./scripts/feeds install -a || true
+
+      # ==================== 步骤5：配置与下载 ====================
+      - name: 生成配置并预下载依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${SDK_DIR}"
+          if ! make defconfig > /tmp/defconfig.log 2>&1; then
+            sed -i '/select PACKAGE_busybox-selinux/d; /select PACKAGE_procd-selinux/d' config/Config-build.in
+            sed -i 's/ +SELINUX:busybox-selinux +!SELINUX:busybox//g' package/base-files/Makefile
+            make defconfig > /tmp/defconfig.log 2>&1
+          fi
+          make download -j"$(nproc)" V=s || true
+
+      # ==================== 步骤6：编译插件 ====================
+      - name: 编译插件
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${SDK_DIR}"
+          PLUGIN_INPUT="${{ github.event.inputs.plugin_name }}"
+          read -r -a PLUGINS <<< "${PLUGIN_INPUT//,/ }"
+          MISSING=""
+          
+          for name in "${PLUGINS[@]}"; do
+            [[ -z "$name" ]] && continue
+            
+            # 清理其他feed中的同名冲突
+            if [[ -d "feeds/custom/${name}" && ! -e "package/feeds/custom/${name}" ]]; then
+              OTHER=$(find feeds -mindepth 2 -type d -name "${name}" -not -path 'feeds/custom*' -not -path '*/.git*' 2>/dev/null || true)
+              if [[ -n "$OTHER" ]]; then
+                for d in $OTHER; do rm -rf "$d" "package/feeds/${d#feeds/}"; done
+                ./scripts/feeds install -a -p custom || true
+              fi
+            fi
+            
+            # 查找目标插件路径
+            TARGET=""
+            if [[ -d "package/feeds/custom/${name}" ]]; then
+              TARGET="package/feeds/custom/${name}"
+            else
+              TARGET=$(find package/feeds -type d -name "${name}" -not -path '*/.git/*' 2>/dev/null | head -n1 || true)
+              [[ -z "$TARGET" && -d "package/${name}" ]] && TARGET="package/${name}"
+            fi
+            
+            if [[ -z "$TARGET" || ! -f "${TARGET}/Makefile" ]]; then
+              MISSING="${MISSING} ${name}"
+              continue
+            fi
+            
+            # 优先多线程编译，失败则单线程输出详细日志重试
+            make "${TARGET}/compile" -j"$(nproc)" || make "${TARGET}/compile" -j1 V=s
+          done
+          
+          if [[ -n "$MISSING" ]]; then
+            echo "::error::以下插件未找到: ${MISSING}"
+            exit 1
+          fi
+
+      # ==================== 步骤7：收集并上传产物 ====================
+      - name: 收集与上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.event.inputs.architecture }}-${{ env.SDK_TAG }}
+          path: ${{ env.SDK_DIR }}/bin/**/*.ipk
+          if-no-files-found: error
+          retention-days: 7
+
+      # ==================== 步骤8：自动化清理 ====================
+      - name: 清理工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO=${{ github.repository }}
+          echo "==== 开始清理 $REPO 的历史记录 ===="
+          
+          # 1. 删除所有失败和被取消的记录
+          echo "正在清理 失败/取消 的记录..."
+          gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .id' | \
+          xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
+          
+          # 2. 删除3天前的成功记录
+          CUTOFF=$(date -d "3 days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "正在清理 $CUTOFF 之前的成功记录..."
+          gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="success" and .created_at < "'$CUTOFF'") | .id' | \
+          xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
+          
+          echo "==== 清理完成 ===="
