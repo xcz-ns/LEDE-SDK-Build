@@ -117,11 +117,6 @@ jobs:
           sed -i 's/CONFIG_PACKAGE_apk-openssl=y/# CONFIG_PACKAGE_apk-openssl is not set/g' .config
           sed -i 's/CONFIG_PACKAGE_apk-mbedtls=y/# CONFIG_PACKAGE_apk-mbedtls is not set/g' .config
           
-          echo "=> 开始多线程预下载依赖..."
-          make download -j"$(nproc)" || {
-            echo "::warning::多线程下载失败，正在使用单线程带详细日志重试..."
-            make download -j1 V=s
-          }
 
       # ==================== 步骤6：编译插件 ====================
       - name: 🛠️ 启动目标插件编译
