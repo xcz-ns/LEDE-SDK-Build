@@ -33,7 +33,7 @@ jobs:
 
     steps:
       # ==================== 步骤1：解析 SDK ====================
-      - name: 解析 SDK 标签与资产
+      - name: 🔍 解析系统构建资产
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,7 +61,7 @@ jobs:
           exit 1
 
       # ==================== 步骤2：下载解压 SDK ====================
-      - name: 下载并解压 SDK
+      - name: 📥 下载解压核心环境
         shell: bash
         run: |
           set -euo pipefail
@@ -71,7 +71,7 @@ jobs:
           echo "SDK_DIR=$(ls -d openwrt-sdk-* | head -n1)" >> "$GITHUB_ENV"
 
       # ==================== 步骤3：智能提取插件源码 ====================
-      - name: 下载并配置插件源码
+      - name: 📂 智能提取插件源码
         shell: bash
         run: |
           set -euo pipefail
@@ -93,7 +93,7 @@ jobs:
           fi
 
       # ==================== 步骤4：安装官方 feeds ====================
-      - name: 更新并安装 feeds
+      - name: 🔄 更新安装官方源包
         shell: bash
         run: |
           set -euo pipefail
@@ -102,19 +102,29 @@ jobs:
           ./scripts/feeds install -a
 
       # ==================== 步骤5：配置与下载 ====================
-      - name: 生成配置并预下载依赖
+      - name: ⚙️ 生成配置预载依赖
         shell: bash
         run: |
           set -euo pipefail
           cd "${SDK_DIR}"
           make defconfig
+          
+          echo "=> 屏蔽不需要的 apk 包，防止下载报错..."
+          # 1. 从 feeds 软链中强行卸载 apk
+          ./scripts/feeds uninstall apk || true
+          # 2. 将 .config 配置文件中所有选中 apk 的选项改为不选中
+          sed -i 's/CONFIG_PACKAGE_apk=y/# CONFIG_PACKAGE_apk is not set/g' .config
+          sed -i 's/CONFIG_PACKAGE_apk-openssl=y/# CONFIG_PACKAGE_apk-openssl is not set/g' .config
+          sed -i 's/CONFIG_PACKAGE_apk-mbedtls=y/# CONFIG_PACKAGE_apk-mbedtls is not set/g' .config
+          
+          echo "=> 开始多线程预下载依赖..."
           make download -j"$(nproc)" || {
             echo "::warning::多线程下载失败，正在使用单线程带详细日志重试..."
             make download -j1 V=s
           }
 
       # ==================== 步骤6：编译插件 ====================
-      - name: 编译插件
+      - name: 🛠️ 启动目标插件编译
         shell: bash
         run: |
           set -euo pipefail
@@ -152,7 +162,7 @@ jobs:
           fi
 
       # ==================== 步骤7：收集并上传产物 ====================
-      - name: 收集与上传产物
+      - name: 📤 收集上传编译产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-${{ github.event.inputs.architecture }}-${{ env.SDK_TAG }}
@@ -161,7 +171,7 @@ jobs:
           retention-days: 7
 
       # ==================== 步骤8：自动化清理 ====================
-      - name: 清理工作流运行记录
+      - name: 🧹 清理历史运行记录
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
