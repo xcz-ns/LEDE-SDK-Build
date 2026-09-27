@@ -8,6 +8,7 @@ on:
         required: true
         type: string
         default: ""
+
       architecture:
         description: "选择目标架构"
         required: true
@@ -16,6 +17,7 @@ on:
           - LEDE_Cudy
           - LEDE_R3S
           - LEDE_x86
+
       plugin_name:
         description: "插件包（空格或逗号连接）"
         required: true
@@ -32,153 +34,349 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ==================== 步骤1：解析 SDK ====================
-      - name: 🔍 解析系统构建资产
+
+      # ============================================================
+      # 1. 查找对应架构 SDK
+      # ============================================================
+      - name: 🔍 查找 SDK
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARCH: ${{ github.event.inputs.architecture }}
-          SDK_REPO: "xcz-ns/LEDE"
+          ARCH: ${{ inputs.architecture }}
+          SDK_REPO: xcz-ns/LEDE
+          PLUGIN_INPUT: ${{ inputs.plugin_name }}
         run: |
           set -euo pipefail
-          ARTIFACT_NAME=$(printf '%s' "${{ github.event.inputs.plugin_name }}" | tr -c 'A-Za-z0-9._-' '-')
+
+          # 规范化插件名称用于 Artifact
+          ARTIFACT_NAME=$(printf '%s' "$PLUGIN_INPUT" \
+            | tr ', ' '__' \
+            | tr -cs 'A-Za-z0-9._-' '-')
+
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
           echo "SDK_REPO=$SDK_REPO" >> "$GITHUB_ENV"
-          
-          TAGS=$(gh release list -R "$SDK_REPO" -L 100 --json tagName -q '.[].tagName | select(endswith("'"$ARCH"'"))')
-          [[ -z "$TAGS" ]] && { echo "::error::未找到以 ${ARCH} 结尾的 release 标签"; exit 1; }
-          
-          for tag in $TAGS; do
-            ASSET=$(gh release view "$tag" -R "$SDK_REPO" --json assets -q '.assets[].name | select(test("^openwrt-sdk.*\\.tar\\.xz$"))' | head -n1 || true)
-            if [[ -n "$ASSET" ]]; then
-              echo "SDK_TAG=$tag" >> "$GITHUB_ENV"
-              echo "SDK_ASSET=$ASSET" >> "$GITHUB_ENV"
-              exit 0
-            fi
-          done
-          
-          echo "::error::所选架构未找到 openwrt-sdk 资产"
-          exit 1
 
-      # ==================== 步骤2：下载解压 SDK ====================
-      - name: 📥 下载解压核心环境
-        shell: bash
-        run: |
-          set -euo pipefail
-          url="https://github.com/${SDK_REPO}/releases/download/${SDK_TAG}/${SDK_ASSET}"
-          curl -fL --retry 3 --retry-delay 5 -sS -o sdk.tar.xz "${url}"
-          tar -xJf sdk.tar.xz
-          echo "SDK_DIR=$(ls -d openwrt-sdk-* | head -n1)" >> "$GITHUB_ENV"
+          echo "==== 查找 ${ARCH} SDK ===="
 
-      # ==================== 步骤3：智能提取插件源码 ====================
-      - name: 📂 引入第三方插件源码
-        shell: bash
-        run: |
-          set -euo pipefail
-          REPO_NORM=$(echo "${{ github.event.inputs.firmware_repo }}" | sed -E 's|.*github\.com[:/]?([^/]+/[^/.]+)(\.git)?|\1|')
-          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}.git" /tmp/custom_source
-          
-          cd "${SDK_DIR}"
-          
-          # 核心判断逻辑：对应单插件、多插件源、嵌套子目录等三种情况
-          if [ -f "/tmp/custom_source/Makefile" ]; then
-            # 根目录直接包含 Makefile (单插件仓库)
-            echo "=> 检测到【单插件源码】，重命名并移动至 package/ 目录"
-            PLUGIN_DIR_NAME=$(echo "${{ github.event.inputs.plugin_name }}" | awk -F'[, ]+' '{print $1}')
-            mv /tmp/custom_source "package/${PLUGIN_DIR_NAME}"
-          else
-            # 根目录没有 Makefile (多插件或嵌套结构仓库)
-            echo "=> 检测到【多插件/嵌套子目录】源码，移入 package/custom/ 目录"
-            mkdir -p package/custom/
-            mv /tmp/custom_source/* package/custom/ 2>/dev/null || true
-          fi
+          TAGS=$(gh release list \
+            -R "$SDK_REPO" \
+            -L 100 \
+            --json tagName \
+            -q '.[].tagName | select(endswith("'"$ARCH"'"))')
 
-      # ==================== 步骤4：加载软件列表 ====================
-      - name: 🔄 更新与安装 feeds
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${SDK_DIR}/package/custom/"
-          ls -lah
-          # ./scripts/feeds update -a
-          # ./scripts/feeds install -a
-
-      # ==================== 步骤5：配置全局构建选项 ====================
-      - name: ⚙️ 生成配置并取消全局默认
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${SDK_DIR}"
-          touch .config
-          
-          # 取消选择默认编译所有软件包的选项，避免编译整个环境的可用软件
-          echo "# CONFIG_ALL is not set" >> .config
-          echo "# CONFIG_ALL_KMODS is not set" >> .config
-          echo "# CONFIG_ALL_NONSHARED is not set" >> .config
-          
-          make defconfig
-
-      # ==================== 步骤6：严格验证与动态编译 ====================
-      - name: 🛠️ 启动目标插件编译
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${SDK_DIR}"
-          PLUGIN_INPUT="${{ github.event.inputs.plugin_name }}"
-          read -r -a PLUGINS <<< "${PLUGIN_INPUT//,/ }"
-          MISSING=""
-          
-          for name in "${PLUGINS[@]}"; do
-            [[ -z "$name" ]] && continue
-            
-            # 动态寻址核心：在 package 目录下全局寻找名为 $name 的文件夹
-            TARGET=$(find package -type d -name "${name}" -not -path '*/.git*' | while read -r dir; do
-              # 严格验证该目录下是否存在 Makefile，存在才认为是有效路径
-              if [[ -f "$dir/Makefile" ]]; then
-                echo "$dir"
-                break
-              fi
-            done)
-            
-            # 如果没找到 Makefile，或者目录不存在，则记录并跳过
-            if [[ -z "$TARGET" ]]; then
-              MISSING="${MISSING} ${name}"
-              continue
-            fi
-            
-            # 此时的 TARGET 就是包含了 Makefile 的真实相对路径
-            echo "=> 锁定插件真实路径并准备编译: ${TARGET}"
-            make "${TARGET}/compile" -j"$(nproc)" || make "${TARGET}/compile" -j1 V=s
-          done
-          
-          if [[ -n "$MISSING" ]]; then
-            echo "::error::以下插件未找到或缺少 Makefile: ${MISSING}"
+          if [[ -z "$TAGS" ]]; then
+            echo "::error::未找到以 ${ARCH} 结尾的 Release"
             exit 1
           fi
 
-      # ==================== 步骤7：收集并上传产物 ====================
-      - name: 📤 收集上传编译产物
+          for tag in $TAGS; do
+            ASSET=$(gh release view "$tag" \
+              -R "$SDK_REPO" \
+              --json assets \
+              -q '.assets[].name | select(test("^openwrt-sdk.*\\.tar\\.xz$"))' \
+              | head -n1 || true)
+
+            if [[ -n "$ASSET" ]]; then
+              echo "SDK_TAG=$tag" >> "$GITHUB_ENV"
+              echo "SDK_ASSET=$ASSET" >> "$GITHUB_ENV"
+
+              echo "SDK Release : $tag"
+              echo "SDK Asset   : $ASSET"
+
+              exit 0
+            fi
+          done
+
+          echo "::error::${ARCH} 未找到 openwrt-sdk*.tar.xz"
+          exit 1
+
+
+      # ============================================================
+      # 2. 下载并解压 SDK
+      # ============================================================
+      - name: 📥 下载 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/${SDK_REPO}/releases/download/${SDK_TAG}/${SDK_ASSET}"
+
+          echo "下载：$URL"
+
+          curl -fL \
+            --retry 3 \
+            --retry-delay 5 \
+            -sS \
+            -o sdk.tar.xz \
+            "$URL"
+
+          tar -xJf sdk.tar.xz
+
+          SDK_DIR=$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)
+
+          if [[ -z "$SDK_DIR" ]]; then
+            echo "::error::SDK 解压失败"
+            exit 1
+          fi
+
+          SDK_DIR="${SDK_DIR#./}"
+
+          echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
+
+          echo "SDK 目录：$SDK_DIR"
+
+
+      # ============================================================
+      # 3. 导入插件源码
+      # ============================================================
+      - name: 📂 导入插件源码
+        shell: bash
+        env:
+          REPO_URL: ${{ inputs.firmware_repo }}
+          PLUGIN_INPUT: ${{ inputs.plugin_name }}
+        run: |
+          set -euo pipefail
+
+          echo "==== 解析插件仓库 ===="
+
+          REPO_NORM=$(echo "$REPO_URL" \
+            | sed -E 's|.*github\.com[:/]?([^/]+/[^/.]+)(\.git)?|\1|')
+
+          if [[ -z "$REPO_NORM" ]]; then
+            echo "::error::无法解析 GitHub 仓库地址"
+            exit 1
+          fi
+
+          echo "仓库：$REPO_NORM"
+
+          git clone \
+            --depth 1 \
+            --single-branch \
+            "https://github.com/${REPO_NORM}.git" \
+            /tmp/custom_source
+
+          cd "$SDK_DIR"
+
+          # ----------------------------------------------------------
+          # 解析第一个插件名称
+          # ----------------------------------------------------------
+          FIRST_PLUGIN=$(echo "$PLUGIN_INPUT" \
+            | tr ',' ' ' \
+            | awk '{print $1}')
+
+          if [[ -z "$FIRST_PLUGIN" ]]; then
+            echo "::error::插件名称不能为空"
+            exit 1
+          fi
+
+          # ----------------------------------------------------------
+          # 情况 1：仓库根目录就是插件
+          # ----------------------------------------------------------
+          if [[ -f /tmp/custom_source/Makefile ]]; then
+
+            echo "=> 检测到单插件仓库"
+
+            mkdir -p package
+
+            mv /tmp/custom_source "package/${FIRST_PLUGIN}"
+
+            echo "插件路径：package/${FIRST_PLUGIN}"
+
+          # ----------------------------------------------------------
+          # 情况 2：仓库包含多个插件 / 嵌套目录
+          # ----------------------------------------------------------
+          else
+
+            echo "=> 检测到多插件 / 嵌套插件仓库"
+
+            mkdir -p package/custom
+
+            cp -a /tmp/custom_source/. package/custom/
+
+            echo "插件源码已导入：package/custom/"
+
+          fi
+
+
+      # ============================================================
+      # 4. 初始化 SDK 配置
+      # ============================================================
+      - name: ⚙️ 初始化 SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$SDK_DIR"
+
+          # 禁止 SDK 自动选择全部软件包
+          cat >> .config <<'EOF'
+
+          # SDK custom build
+          # CONFIG_ALL is not set
+          # CONFIG_ALL_KMODS is not set
+          # CONFIG_ALL_NONSHARED is not set
+          EOF
+
+          make defconfig
+
+          echo "==== SDK 配置完成 ===="
+
+
+      # ============================================================
+      # 5. 查找并编译目标插件
+      # ============================================================
+      - name: 🛠️ 编译目标插件
+        shell: bash
+        env:
+          PLUGIN_INPUT: ${{ inputs.plugin_name }}
+        run: |
+          set -euo pipefail
+
+          cd "$SDK_DIR"
+
+          # 支持：
+          # luci-app-a luci-app-b
+          # luci-app-a,luci-app-b
+          # luci-app-a, luci-app-b
+          PLUGIN_INPUT="${PLUGIN_INPUT//,/ }"
+
+          read -r -a PLUGINS <<< "$PLUGIN_INPUT"
+
+          MISSING=()
+
+          for NAME in "${PLUGINS[@]}"; do
+
+            [[ -z "$NAME" ]] && continue
+
+            echo ""
+            echo "============================================================"
+            echo "检查插件：$NAME"
+            echo "============================================================"
+
+            TARGET=""
+
+            # --------------------------------------------------------
+            # 优先检查常见位置
+            # --------------------------------------------------------
+
+            for DIR in \
+              "package/$NAME" \
+              "package/custom/$NAME"
+            do
+              if [[ -f "$DIR/Makefile" ]]; then
+                TARGET="$DIR"
+                break
+              fi
+            done
+
+            # --------------------------------------------------------
+            # 常见位置没找到，再全局搜索
+            # --------------------------------------------------------
+
+            if [[ -z "$TARGET" ]]; then
+              TARGET=$(find package \
+                -type f \
+                -name Makefile \
+                -path "*/$NAME/Makefile" \
+                -not -path '*/.git/*' \
+                -print \
+                -quit \
+                | sed 's|/Makefile$||')
+            fi
+
+            # --------------------------------------------------------
+            # 插件不存在
+            # --------------------------------------------------------
+
+            if [[ -z "$TARGET" ]]; then
+              echo "::error::未找到插件：$NAME"
+              MISSING+=("$NAME")
+              continue
+            fi
+
+            echo "=> 插件路径：$TARGET"
+
+            # --------------------------------------------------------
+            # 编译
+            # --------------------------------------------------------
+
+            echo "=> 开始并行编译：$NAME"
+
+            if ! make "${TARGET}/compile" -j"$(nproc)"; then
+
+              echo ""
+              echo "============================================================"
+              echo "并行编译失败，切换单线程详细日志"
+              echo "插件：$NAME"
+              echo "============================================================"
+
+              make "${TARGET}/compile" -j1 V=s
+            fi
+
+          done
+
+          # ----------------------------------------------------------
+          # 汇总缺失插件
+          # ----------------------------------------------------------
+
+          if (( ${#MISSING[@]} > 0 )); then
+            echo ""
+            echo "::error::以下插件未找到或缺少 Makefile："
+            printf ' - %s\n' "${MISSING[@]}"
+            exit 1
+          fi
+
+          echo ""
+          echo "============================================================"
+          echo "所有目标插件编译完成"
+          echo "============================================================"
+
+
+      # ============================================================
+      # 6. 上传 IPK
+      # ============================================================
+      - name: 📤 上传编译产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}-${{ github.event.inputs.architecture }}-${{ env.SDK_TAG }}
+          name: ${{ env.ARTIFACT_NAME }}-${{ inputs.architecture }}-${{ env.SDK_TAG }}
           path: ${{ env.SDK_DIR }}/bin/**/*.ipk
           if-no-files-found: error
           retention-days: 7
 
-      # ==================== 步骤8：自动化清理 ====================
+
+      # ============================================================
+      # 7. 清理历史运行
+      # ============================================================
       - name: 🧹 清理历史运行记录
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          REPO=${{ github.repository }}
-          echo "==== 开始清理 $REPO 的历史记录 ===="
-          
-          gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="failure" or .conclusion=="cancelled") | .id' | \
-          xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
-          
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+
+          echo "==== 清理失败 / 取消的运行记录 ===="
+
+          gh api "repos/${REPO}/actions/runs" \
+            --paginate \
+            -q '.workflow_runs[]
+                | select(.conclusion=="failure" or .conclusion=="cancelled")
+                | .id' |
+          xargs -r -I {} \
+            gh api -X DELETE "repos/${REPO}/actions/runs/{}"
+
+          echo "==== 清理 3 天以前的成功记录 ===="
+
           CUTOFF=$(date -d "3 days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
-          gh api repos/$REPO/actions/runs --paginate -q '.workflow_runs[] | select(.conclusion=="success" and .created_at < "'$CUTOFF'") | .id' | \
-          xargs -r -I {} gh api -X DELETE repos/$REPO/actions/runs/{}
-          
+
+          gh api "repos/${REPO}/actions/runs" \
+            --paginate \
+            -q '.workflow_runs[]
+                | select(.conclusion=="success" and .created_at < "'"$CUTOFF"'")
+                | .id' |
+          xargs -r -I {} \
+            gh api -X DELETE "repos/${REPO}/actions/runs/{}"
+
           echo "==== 清理完成 ===="
