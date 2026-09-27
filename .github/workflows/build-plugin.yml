@@ -147,8 +147,6 @@ jobs:
             
             # 此时的 TARGET 就是包含了 Makefile 的真实相对路径
             echo "=> 锁定插件真实路径并准备编译: ${TARGET}"
-            make "${TARGET}/download" V=s
-            make "${TARGET}/prepare" V=s
             make "${TARGET}/compile" -j"$(nproc)" || make "${TARGET}/compile" -j1 V=s
           done
           
