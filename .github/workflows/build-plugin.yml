@@ -98,9 +98,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd "${SDK_DIR}"
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          cd "${SDK_DIR}/package/custom/"
+          ls -lah
+          # ./scripts/feeds update -a
+          # ./scripts/feeds install -a
 
       # ==================== 步骤5：配置全局构建选项 ====================
       - name: ⚙️ 生成配置并取消全局默认
