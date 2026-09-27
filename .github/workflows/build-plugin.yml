@@ -70,18 +70,28 @@ jobs:
           tar -xJf sdk.tar.xz
           echo "SDK_DIR=$(ls -d openwrt-sdk-* | head -n1)" >> "$GITHUB_ENV"
 
-      # ==================== 步骤3：配置自定义软件 Feed ====================
+      # ==================== 步骤3：智能提取插件源码 ====================
       - name: 📂 引入第三方插件源码
         shell: bash
         run: |
           set -euo pipefail
           REPO_NORM=$(echo "${{ github.event.inputs.firmware_repo }}" | sed -E 's|.*github\.com[:/]?([^/]+/[^/.]+)(\.git)?|\1|')
-          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}.git" /tmp/custom_feed
+          git clone --depth 1 --single-branch "https://github.com/${REPO_NORM}.git" /tmp/custom_source
           
           cd "${SDK_DIR}"
-          # 核心修改：如果要覆盖来自现有 feeds 的软件，必须在包含要覆盖软件 feed 的行上方编写自定义 feed。
-          # 这里将我们下载的第三方仓库作为 local feed 插入到 feeds.conf.default 的第一行。
-          sed -i '1i src-link custom /tmp/custom_feed' feeds.conf.default
+          
+          # 核心判断逻辑：对应单插件、多插件源、嵌套子目录等三种情况
+          if [ -f "/tmp/custom_source/Makefile" ]; then
+            # 根目录直接包含 Makefile (单插件仓库)
+            echo "=> 检测到【单插件源码】，重命名并移动至 package/ 目录"
+            PLUGIN_DIR_NAME=$(echo "${{ github.event.inputs.plugin_name }}" | awk -F'[, ]+' '{print $1}')
+            mv /tmp/custom_source "package/${PLUGIN_DIR_NAME}"
+          else
+            # 根目录没有 Makefile (多插件或嵌套结构仓库)
+            echo "=> 检测到【多插件/嵌套子目录】源码，移入 package/custom/ 目录"
+            mkdir -p package/custom/
+            mv /tmp/custom_source/* package/custom/ 2>/dev/null || true
+          fi
 
       # ==================== 步骤4：加载软件列表 ====================
       - name: 🔄 更新与安装 feeds
@@ -89,9 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "${SDK_DIR}"
-          # 获取和更新定义软件
           ./scripts/feeds update -a
-          # 准备软件及其依赖项，使其可用
           ./scripts/feeds install -a
 
       # ==================== 步骤5：配置全局构建选项 ====================
@@ -102,14 +110,14 @@ jobs:
           cd "${SDK_DIR}"
           touch .config
           
-          # 根据文档要求，取消选择默认编译所有软件包的选项，避免编译所有可用软件
+          # 取消选择默认编译所有软件包的选项，避免编译整个环境的可用软件
           echo "# CONFIG_ALL is not set" >> .config
           echo "# CONFIG_ALL_KMODS is not set" >> .config
           echo "# CONFIG_ALL_NONSHARED is not set" >> .config
           
           make defconfig
 
-      # ==================== 步骤6：编译插件 ====================
+      # ==================== 步骤6：严格验证与动态编译 ====================
       - name: 🛠️ 启动目标插件编译
         shell: bash
         run: |
@@ -117,20 +125,43 @@ jobs:
           cd "${SDK_DIR}"
           PLUGIN_INPUT="${{ github.event.inputs.plugin_name }}"
           read -r -a PLUGINS <<< "${PLUGIN_INPUT//,/ }"
+          MISSING=""
           
           for name in "${PLUGINS[@]}"; do
             [[ -z "$name" ]] && continue
             
-            echo "=> 准备编译: ${name}"
-            make "package/${name}/compile" -j"$(nproc)" || make "package/${name}/compile" -j1 V=s
+            # 动态寻址核心：在 package 目录下全局寻找名为 $name 的文件夹
+            TARGET=$(find package -type d -name "${name}" -not -path '*/.git*' | while read -r dir; do
+              # 严格验证该目录下是否存在 Makefile，存在才认为是有效路径
+              if [[ -f "$dir/Makefile" ]]; then
+                echo "$dir"
+                break
+              fi
+            done)
+            
+            # 如果没找到 Makefile，或者目录不存在，则记录并跳过
+            if [[ -z "$TARGET" ]]; then
+              MISSING="${MISSING} ${name}"
+              continue
+            fi
+            
+            # 此时的 TARGET 就是包含了 Makefile 的真实相对路径
+            echo "=> 锁定插件真实路径并准备编译: ${TARGET}"
+            make "${TARGET}/download" V=s
+            make "${TARGET}/prepare" V=s
+            make "${TARGET}/compile" -j"$(nproc)" || make "${TARGET}/compile" -j1 V=s
           done
+          
+          if [[ -n "$MISSING" ]]; then
+            echo "::error::以下插件未找到或缺少 Makefile: ${MISSING}"
+            exit 1
+          fi
 
       # ==================== 步骤7：收集并上传产物 ====================
       - name: 📤 收集上传编译产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-${{ github.event.inputs.architecture }}-${{ env.SDK_TAG }}
-          # 编译完成后，生成的 .ipk 文件将放置在 bin/packages 和 bin/targets 目录中
           path: ${{ env.SDK_DIR }}/bin/**/*.ipk
           if-no-files-found: error
           retention-days: 7
