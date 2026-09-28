@@ -237,11 +237,15 @@ jobs:
             '# CONFIG_ALL_NONSHARED is not set' > .config
           make defconfig
 
-          # defconfig 会选中 SDK 平台默认包（linux-firmware、luci-proto-ppp、无关 kmod 等）；
-          # 这里把所有 CONFIG_PACKAGE_*=y 显式关掉，只保留编译时通过 CONFIG_PACKAGE_<name>=y
-          # 显式指定的包——OpenWrt 依赖解析会自动拉回目标插件真正需要的依赖，跳过无关包，大幅加快速度
+          # 第一次 defconfig 生成完整 .config（含所有 Kconfig 项）；
+          # sed 把 SDK 平台默认选中的用户包全部显式禁用，
+          # 编译时通过 CONFIG_PACKAGE_<name>=y 按需拉目标插件及其依赖，跳过无关包
           sed -i -E 's/^(CONFIG_PACKAGE_[A-Za-z0-9_.-]+)=y$/# \1 is not set/' .config
-          make defconfig
+          # 必须显式保留 openssl TLS 栈，否则 ustream-ssl 会误选 mbedtls 变体导致编译失败
+          printf '%s\n' \
+            'CONFIG_PACKAGE_libustream-openssl=y' \
+            'CONFIG_PACKAGE_libopenssl=y' >> .config
+          # 不再跑第二次 defconfig：.config 已完整，make 编译时自动处理依赖，省一步
 
           echo "✅ 配置生成完毕（仅按需编译目标插件及其依赖）"
           PKG_COUNT=$(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.-]+=y' .config || true)
