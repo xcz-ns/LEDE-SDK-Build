@@ -48,7 +48,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 规范化插件名称用于 Artifact
+          echo "============================================================"
+          echo "查找对应架构 SDK"
+          echo "============================================================"
+
+          # 规范化插件名称用于最终 Artifact
           ARTIFACT_NAME=$(printf '%s' "$PLUGIN_INPUT" \
             | tr ', ' '__' \
             | tr -cs 'A-Za-z0-9._-' '-')
@@ -56,7 +60,12 @@ jobs:
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
           echo "SDK_REPO=$SDK_REPO" >> "$GITHUB_ENV"
 
-          echo "==== 查找 ${ARCH} SDK ===="
+          echo ""
+          echo "目标架构：$ARCH"
+
+          # ----------------------------------------------------------
+          # 查找 SDK Release
+          # ----------------------------------------------------------
 
           TAGS=$(gh release list \
             -R "$SDK_REPO" \
@@ -70,6 +79,7 @@ jobs:
           fi
 
           for tag in $TAGS; do
+
             ASSET=$(gh release view "$tag" \
               -R "$SDK_REPO" \
               --json assets \
@@ -77,14 +87,17 @@ jobs:
               | head -n1 || true)
 
             if [[ -n "$ASSET" ]]; then
+
               echo "SDK_TAG=$tag" >> "$GITHUB_ENV"
               echo "SDK_ASSET=$ASSET" >> "$GITHUB_ENV"
 
+              echo ""
               echo "SDK Release : $tag"
               echo "SDK Asset   : $ASSET"
 
               exit 0
             fi
+
           done
 
           echo "::error::${ARCH} 未找到 openwrt-sdk*.tar.xz"
@@ -99,9 +112,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "============================================================"
+          echo "下载 SDK"
+          echo "============================================================"
+
           URL="https://github.com/${SDK_REPO}/releases/download/${SDK_TAG}/${SDK_ASSET}"
 
-          echo "下载：$URL"
+          echo "下载地址：$URL"
 
           curl -fL \
             --retry 3 \
@@ -110,12 +127,24 @@ jobs:
             -o sdk.tar.xz \
             "$URL"
 
+          echo ""
+          echo "SDK 压缩包大小："
+          du -h sdk.tar.xz
+
+          echo ""
+          echo "解压 SDK..."
+
           tar -xJf sdk.tar.xz
 
-          SDK_DIR=$(find . -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n1)
+          SDK_DIR=$(find . \
+            -maxdepth 1 \
+            -type d \
+            -name 'openwrt-sdk-*' \
+            -print \
+            -quit)
 
           if [[ -z "$SDK_DIR" ]]; then
-            echo "::error::SDK 解压失败"
+            echo "::error::SDK 解压失败，没有找到 openwrt-sdk-* 目录"
             exit 1
           fi
 
@@ -123,11 +152,515 @@ jobs:
 
           echo "SDK_DIR=$SDK_DIR" >> "$GITHUB_ENV"
 
+          echo ""
           echo "SDK 目录：$SDK_DIR"
+
+          echo ""
+          echo "==== SDK 基本结构 ===="
+
+          ls -lah "$SDK_DIR"
+
+          echo ""
+          echo "==== SDK staging_dir ===="
+
+          if [[ -d "$SDK_DIR/staging_dir" ]]; then
+            du -sh "$SDK_DIR/staging_dir" || true
+            find "$SDK_DIR/staging_dir" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -printf '%f\n' |
+              sort
+          else
+            echo "::warning::SDK 中没有 staging_dir"
+          fi
 
 
       # ============================================================
-      # 3. 导入插件源码
+      # 3. 恢复 LEDE 预编译缓存
+      #
+      # 对应：
+      #
+      #   LEDE_Cudy -> Cache_LEDE_Cudy
+      #   LEDE_R3S  -> Cache_LEDE_R3S
+      #   LEDE_x86  -> Cache_LEDE_x86
+      #
+      # Artifact 内：
+      #
+      #   cache_export_LEDE_xxx.tzst
+      #
+      # tzst 内：
+      #
+      #   staging_dir/host*
+      #   staging_dir/tool*
+      #   .ccache
+      # ============================================================
+      - name: ⚡ 恢复 LEDE 预编译缓存
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CACHE_REPO: xcz-ns/LEDE
+          ARCH: ${{ inputs.architecture }}
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "恢复 LEDE 预编译缓存"
+          echo "============================================================"
+
+          # ----------------------------------------------------------
+          # 根据架构确定 Artifact 名称
+          # ----------------------------------------------------------
+
+          case "$ARCH" in
+
+            LEDE_Cudy)
+              CACHE_ARTIFACT="Cache_LEDE_Cudy"
+              ;;
+
+            LEDE_R3S)
+              CACHE_ARTIFACT="Cache_LEDE_R3S"
+              ;;
+
+            LEDE_x86)
+              CACHE_ARTIFACT="Cache_LEDE_x86"
+              ;;
+
+            *)
+              echo "::error::未知架构：$ARCH"
+              exit 1
+              ;;
+
+          esac
+
+          echo "目标架构    ：$ARCH"
+          echo "缓存仓库    ：$CACHE_REPO"
+          echo "缓存 Artifact：$CACHE_ARTIFACT"
+
+          CACHE_ROOT="$RUNNER_TEMP/lede_cache"
+          ARTIFACT_ZIP="$CACHE_ROOT/artifact.zip"
+          ARTIFACT_DIR="$CACHE_ROOT/artifact"
+          EXTRACT_DIR="$CACHE_ROOT/extracted"
+
+          rm -rf "$CACHE_ROOT"
+
+          mkdir -p "$ARTIFACT_DIR"
+          mkdir -p "$EXTRACT_DIR"
+
+          # ==========================================================
+          # 3.1 查询 Artifact
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "查询最新可用 Artifact"
+          echo "============================================================"
+
+          ARTIFACT_JSON=$(gh api \
+            --method GET \
+            "/repos/${CACHE_REPO}/actions/artifacts" \
+            -f "name=${CACHE_ARTIFACT}" \
+            -f "per_page=100")
+
+          echo ""
+          echo "找到的 Artifact："
+
+          printf '%s\n' "$ARTIFACT_JSON" |
+            jq -r '
+              .artifacts[]
+              | "\(.id) | \(.name) | \(.created_at) | expired=\(.expired)"
+            ' || true
+
+          # ----------------------------------------------------------
+          # 取最新未过期 Artifact
+          # ----------------------------------------------------------
+
+          ARTIFACT_ID=$(printf '%s' "$ARTIFACT_JSON" |
+            jq -r '
+              .artifacts
+              | map(select(.expired == false))
+              | sort_by(.created_at)
+              | reverse
+              | .[0].id // empty
+            ')
+
+          ARTIFACT_SIZE=$(printf '%s' "$ARTIFACT_JSON" |
+            jq -r '
+              .artifacts
+              | map(select(.expired == false))
+              | sort_by(.created_at)
+              | reverse
+              | .[0].size_in_bytes // empty
+            ')
+
+          ARTIFACT_CREATED=$(printf '%s' "$ARTIFACT_JSON" |
+            jq -r '
+              .artifacts
+              | map(select(.expired == false))
+              | sort_by(.created_at)
+              | reverse
+              | .[0].created_at // empty
+            ')
+
+          if [[ -z "$ARTIFACT_ID" ]]; then
+
+            echo "::error::没有找到可用的 ${CACHE_ARTIFACT}"
+
+            echo ""
+            echo "请确认 LEDE 仓库的 Export_Caches_to_Artifacts 已经成功运行，"
+            echo "并且 Artifact 尚未超过 retention-days: 7。"
+
+            exit 1
+          fi
+
+          echo ""
+          echo "选择的 Artifact："
+          echo "ID        ：$ARTIFACT_ID"
+          echo "大小      ：$ARTIFACT_SIZE bytes"
+          echo "创建时间  ：$ARTIFACT_CREATED"
+
+
+          # ==========================================================
+          # 3.2 下载 Artifact ZIP
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "下载 Artifact"
+          echo "============================================================"
+
+          gh api \
+            --method GET \
+            "/repos/${CACHE_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > "$ARTIFACT_ZIP"
+
+          if [[ ! -s "$ARTIFACT_ZIP" ]]; then
+            echo "::error::Artifact 下载失败或文件为空"
+            exit 1
+          fi
+
+          echo "Artifact ZIP：$ARTIFACT_ZIP"
+          echo "ZIP 大小：$(du -h "$ARTIFACT_ZIP" | awk '{print $1}')"
+
+
+          # ==========================================================
+          # 3.3 解压 Artifact ZIP
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "解压 Artifact ZIP"
+          echo "============================================================"
+
+          unzip -q \
+            "$ARTIFACT_ZIP" \
+            -d "$ARTIFACT_DIR"
+
+          echo ""
+          echo "Artifact 解压结构："
+
+          find "$ARTIFACT_DIR" \
+            -maxdepth 4 \
+            -printf '%y %p\n' |
+            sort
+
+
+          # ==========================================================
+          # 3.4 自动寻找 tzst
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "寻找缓存压缩包"
+          echo "============================================================"
+
+          mapfile -t TZST_FILES < <(
+            find "$ARTIFACT_DIR" \
+              -type f \
+              \( \
+                -name "*.tzst" \
+                -o -name "*.tar.zst" \
+              \) \
+              -print
+          )
+
+          if (( ${#TZST_FILES[@]} == 0 )); then
+            echo "::error::Artifact 中没有找到 .tzst / .tar.zst 文件"
+            exit 1
+          fi
+
+          if (( ${#TZST_FILES[@]} > 1 )); then
+            echo "::warning::Artifact 中找到多个缓存压缩包："
+            printf ' - %s\n' "${TZST_FILES[@]}"
+          fi
+
+          TZST_FILE="${TZST_FILES[0]}"
+
+          echo ""
+          echo "使用缓存文件："
+          echo "$TZST_FILE"
+
+
+          # ==========================================================
+          # 3.5 检查缓存文件名
+          # ==========================================================
+
+          EXPECTED_TZST="cache_export_${ARCH}.tzst"
+          ACTUAL_TZST=$(basename "$TZST_FILE")
+
+          echo ""
+          echo "预期文件：$EXPECTED_TZST"
+          echo "实际文件：$ACTUAL_TZST"
+
+          if [[ "$ACTUAL_TZST" != "$EXPECTED_TZST" ]]; then
+            echo "::warning::缓存文件名与当前架构不完全匹配"
+            echo "继续使用实际找到的缓存文件。"
+          fi
+
+
+          # ==========================================================
+          # 3.6 解压 tzst
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "解压 tzst"
+          echo "============================================================"
+
+          tar \
+            --use-compress-program="zstd -d" \
+            -xf "$TZST_FILE" \
+            -C "$EXTRACT_DIR"
+
+          echo ""
+          echo "==== tzst 解压后的结构 ===="
+
+          find "$EXTRACT_DIR" \
+            -maxdepth 4 \
+            -printf '%y %p\n' |
+            sort |
+            head -n 300
+
+
+          # ==========================================================
+          # 3.7 检查 staging_dir
+          # ==========================================================
+
+          CACHE_STAGING="$EXTRACT_DIR/staging_dir"
+          CACHE_CCACHE="$EXTRACT_DIR/.ccache"
+
+          echo ""
+          echo "============================================================"
+          echo "检查缓存结构"
+          echo "============================================================"
+
+          if [[ ! -d "$CACHE_STAGING" ]]; then
+            echo "::error::缓存中没有 staging_dir"
+            exit 1
+          fi
+
+          if [[ ! -d "$CACHE_CCACHE" ]]; then
+            echo "::error::缓存中没有 .ccache"
+            exit 1
+          fi
+
+          echo "✅ staging_dir 存在"
+          echo "✅ .ccache 存在"
+
+
+          # ==========================================================
+          # 3.8 检查 staging_dir 内容
+          #
+          # Export_Caches_to_Artifacts 当前只导出：
+          #
+          #   host*
+          #   tool*
+          # ==========================================================
+
+          echo ""
+          echo "==== 缓存 staging_dir 一级目录 ===="
+
+          find "$CACHE_STAGING" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%f\n' |
+            sort
+
+          echo ""
+          echo "==== 缓存目录大小 ===="
+
+          du -sh "$CACHE_STAGING" || true
+          du -sh "$CACHE_CCACHE" || true
+
+
+          # ==========================================================
+          # 3.9 合并缓存到 SDK
+          #
+          # 不删除 SDK 原有 staging_dir
+          #
+          # 只合并：
+          #
+          #   staging_dir/host*
+          #   staging_dir/tool*
+          #   .ccache
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "开始将缓存合并到 SDK"
+          echo "============================================================"
+
+          cd "$SDK_DIR"
+
+          mkdir -p staging_dir
+
+
+          # ----------------------------------------------------------
+          # 合并 host*
+          # ----------------------------------------------------------
+
+          while IFS= read -r -d '' DIR; do
+
+            BASENAME=$(basename "$DIR")
+
+            echo ""
+            echo "=> 合并 staging_dir/$BASENAME"
+
+            mkdir -p "$SDK_DIR/staging_dir/$BASENAME"
+
+            rsync -a \
+              --info=stats2 \
+              "$DIR/" \
+              "$SDK_DIR/staging_dir/$BASENAME/"
+
+          done < <(
+            find "$CACHE_STAGING" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -name "host*" \
+              -print0
+          )
+
+
+          # ----------------------------------------------------------
+          # 合并 tool*
+          # ----------------------------------------------------------
+
+          while IFS= read -r -d '' DIR; do
+
+            BASENAME=$(basename "$DIR")
+
+            echo ""
+            echo "=> 合并 staging_dir/$BASENAME"
+
+            mkdir -p "$SDK_DIR/staging_dir/$BASENAME"
+
+            rsync -a \
+              --info=stats2 \
+              "$DIR/" \
+              "$SDK_DIR/staging_dir/$BASENAME/"
+
+          done < <(
+            find "$CACHE_STAGING" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type d \
+              -name "tool*" \
+              -print0
+          )
+
+
+          # ----------------------------------------------------------
+          # 合并 .ccache
+          # ----------------------------------------------------------
+
+          echo ""
+          echo "=> 合并 .ccache"
+
+          mkdir -p "$SDK_DIR/.ccache"
+
+          rsync -a \
+            --info=stats2 \
+            "$CACHE_CCACHE/" \
+            "$SDK_DIR/.ccache/"
+
+
+          # ==========================================================
+          # 3.10 配置 CCACHE_DIR
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "配置 ccache"
+          echo "============================================================"
+
+          echo "CCACHE_DIR=$SDK_DIR/.ccache" >> "$GITHUB_ENV"
+
+          export CCACHE_DIR="$SDK_DIR/.ccache"
+
+          if command -v ccache >/dev/null 2>&1; then
+
+            ccache --set-config=cache_dir="$CCACHE_DIR" || true
+
+            echo ""
+            echo "==== ccache 配置 ===="
+
+            ccache --show-config |
+              grep -E \
+                'cache_dir|max_size|compiler_check|compression' \
+              || true
+
+            echo ""
+            echo "==== ccache 恢复后的统计 ===="
+
+            ccache --show-stats || true
+
+          else
+
+            echo "::warning::系统中没有找到 ccache"
+
+          fi
+
+
+          # ==========================================================
+          # 3.11 最终恢复检查
+          # ==========================================================
+
+          echo ""
+          echo "============================================================"
+          echo "缓存恢复检查"
+          echo "============================================================"
+
+          echo ""
+          echo "==== SDK staging_dir 一级目录 ===="
+
+          find "$SDK_DIR/staging_dir" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -printf '%f\n' |
+            sort
+
+          echo ""
+          echo "==== SDK staging_dir 大小 ===="
+
+          du -sh "$SDK_DIR/staging_dir" || true
+
+          echo ""
+          echo "==== SDK .ccache 大小 ===="
+
+          du -sh "$SDK_DIR/.ccache" || true
+
+          echo ""
+          echo "============================================================"
+          echo "LEDE 预编译缓存恢复完成"
+          echo "============================================================"
+
+
+      # ============================================================
+      # 4. 导入插件源码
       # ============================================================
       - name: 📂 导入插件源码
         shell: bash
@@ -137,7 +670,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "==== 解析插件仓库 ===="
+          echo "============================================================"
+          echo "解析插件仓库"
+          echo "============================================================"
 
           REPO_NORM=$(echo "$REPO_URL" \
             | sed -E 's|.*github\.com[:/]?([^/]+/[^/.]+)(\.git)?|\1|')
@@ -160,6 +695,7 @@ jobs:
           # ----------------------------------------------------------
           # 解析第一个插件名称
           # ----------------------------------------------------------
+
           FIRST_PLUGIN=$(echo "$PLUGIN_INPUT" \
             | tr ',' ' ' \
             | awk '{print $1}')
@@ -172,26 +708,31 @@ jobs:
           # ----------------------------------------------------------
           # 情况 1：仓库根目录就是插件
           # ----------------------------------------------------------
+
           if [[ -f /tmp/custom_source/Makefile ]]; then
 
             echo "=> 检测到单插件仓库"
 
             mkdir -p package
 
-            mv /tmp/custom_source "package/${FIRST_PLUGIN}"
+            mv /tmp/custom_source \
+              "package/${FIRST_PLUGIN}"
 
             echo "插件路径：package/${FIRST_PLUGIN}"
 
           # ----------------------------------------------------------
           # 情况 2：仓库包含多个插件 / 嵌套目录
           # ----------------------------------------------------------
+
           else
 
             echo "=> 检测到多插件 / 嵌套插件仓库"
 
             mkdir -p package/custom
 
-            cp -a /tmp/custom_source/. package/custom/
+            cp -a \
+              /tmp/custom_source/. \
+              package/custom/
 
             echo "插件源码已导入：package/custom/"
 
@@ -199,7 +740,79 @@ jobs:
 
 
       # ============================================================
-      # 4. 初始化 SDK 配置
+      # 5. 更新并安装 feeds
+      #
+      # 注意：
+      #
+      # 这里按照你的要求重新启用：
+      #
+      #   ./scripts/feeds update -a
+      #   ./scripts/feeds install -a
+      #
+      # 这一步可能改变 feeds 中的软件包版本，
+      # 从而降低部分 ccache 的命中率。
+      # ============================================================
+      - name: 📡 更新并安装 feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$SDK_DIR"
+
+          echo "============================================================"
+          echo "开始更新 feeds"
+          echo "============================================================"
+
+          echo ""
+          echo "==== 当前 feeds 配置 ===="
+
+          if [[ -f feeds.conf.default ]]; then
+            cat feeds.conf.default
+          else
+            echo "::warning::没有找到 feeds.conf.default"
+          fi
+
+          echo ""
+          echo "==== SDK 当前 feeds 状态 ===="
+
+          ./scripts/feeds list || true
+
+          echo ""
+          echo "============================================================"
+          echo "执行 feeds update -a"
+          echo "============================================================"
+
+          ./scripts/feeds update -a
+
+          echo ""
+          echo "============================================================"
+          echo "执行 feeds install -a"
+          echo "============================================================"
+
+          ./scripts/feeds install -a
+
+          echo ""
+          echo "============================================================"
+          echo "feeds 更新 / 安装完成"
+          echo "============================================================"
+
+          echo ""
+          echo "==== feeds 最终状态 ===="
+
+          ./scripts/feeds list
+
+          echo ""
+          echo "==== 检查 LuCI 构建框架 ===="
+
+          if [[ -f feeds/luci/luci.mk ]]; then
+            echo "✅ feeds/luci/luci.mk 存在"
+          else
+            echo "::warning::feeds/luci/luci.mk 不存在"
+          fi
+
+
+      # ============================================================
+      # 6. 初始化 SDK 配置
       # ============================================================
       - name: ⚙️ 初始化 SDK
         shell: bash
@@ -208,7 +821,10 @@ jobs:
 
           cd "$SDK_DIR"
 
-          # 禁止 SDK 自动选择全部软件包
+          echo "============================================================"
+          echo "初始化 SDK"
+          echo "============================================================"
+
           cat >> .config <<'EOF'
 
           # SDK custom build
@@ -219,11 +835,12 @@ jobs:
 
           make defconfig
 
+          echo ""
           echo "==== SDK 配置完成 ===="
 
 
       # ============================================================
-      # 5. 查找并编译目标插件
+      # 7. 编译目标插件
       # ============================================================
       - name: 🛠️ 编译目标插件
         shell: bash
@@ -234,10 +851,16 @@ jobs:
 
           cd "$SDK_DIR"
 
+          echo "============================================================"
+          echo "开始编译目标插件"
+          echo "============================================================"
+
           # 支持：
+          #
           # luci-app-a luci-app-b
           # luci-app-a,luci-app-b
           # luci-app-a, luci-app-b
+          #
           PLUGIN_INPUT="${PLUGIN_INPUT//,/ }"
 
           read -r -a PLUGINS <<< "$PLUGIN_INPUT"
@@ -263,10 +886,12 @@ jobs:
               "package/$NAME" \
               "package/custom/$NAME"
             do
+
               if [[ -f "$DIR/Makefile" ]]; then
                 TARGET="$DIR"
                 break
               fi
+
             done
 
             # --------------------------------------------------------
@@ -274,6 +899,7 @@ jobs:
             # --------------------------------------------------------
 
             if [[ -z "$TARGET" ]]; then
+
               TARGET=$(find package \
                 -type f \
                 -name Makefile \
@@ -282,6 +908,7 @@ jobs:
                 -print \
                 -quit \
                 | sed 's|/Makefile$||')
+
             fi
 
             # --------------------------------------------------------
@@ -289,9 +916,13 @@ jobs:
             # --------------------------------------------------------
 
             if [[ -z "$TARGET" ]]; then
+
               echo "::error::未找到插件：$NAME"
+
               MISSING+=("$NAME")
+
               continue
+
             fi
 
             echo "=> 插件路径：$TARGET"
@@ -300,9 +931,13 @@ jobs:
             # 编译
             # --------------------------------------------------------
 
+            echo ""
             echo "=> 开始并行编译：$NAME"
 
-            if ! make "${TARGET}/compile" -j"$(nproc)"; then
+            if ! make \
+              "${TARGET}/compile" \
+              -j"$(nproc)"
+            then
 
               echo ""
               echo "============================================================"
@@ -310,7 +945,11 @@ jobs:
               echo "插件：$NAME"
               echo "============================================================"
 
-              make "${TARGET}/compile" -j1 V=s
+              make \
+                "${TARGET}/compile" \
+                -j1 \
+                V=s
+
             fi
 
           done
@@ -320,10 +959,18 @@ jobs:
           # ----------------------------------------------------------
 
           if (( ${#MISSING[@]} > 0 )); then
+
             echo ""
+            echo "============================================================"
+            echo "插件检查失败"
+            echo "============================================================"
+
             echo "::error::以下插件未找到或缺少 Makefile："
+
             printf ' - %s\n' "${MISSING[@]}"
+
             exit 1
+
           fi
 
           echo ""
@@ -333,7 +980,46 @@ jobs:
 
 
       # ============================================================
-      # 6. 上传 IPK
+      # 8. 输出最终 ccache 命中情况
+      # ============================================================
+      - name: 📊 查看 ccache 最终命中情况
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${SDK_DIR:-}" ]]; then
+            echo "SDK_DIR 未设置"
+            exit 0
+          fi
+
+          export CCACHE_DIR="$SDK_DIR/.ccache"
+
+          echo "============================================================"
+          echo "ccache 最终统计"
+          echo "============================================================"
+
+          if command -v ccache >/dev/null 2>&1; then
+
+            ccache --show-stats || true
+
+            echo ""
+            echo "==== ccache 配置 ===="
+
+            ccache --show-config |
+              grep -E \
+                'cache_dir|max_size|compiler_check|compression' \
+              || true
+
+          else
+
+            echo "::warning::ccache 未安装"
+
+          fi
+
+
+      # ============================================================
+      # 9. 上传 IPK
       # ============================================================
       - name: 📤 上传编译产物
         uses: actions/upload-artifact@v4
@@ -345,7 +1031,7 @@ jobs:
 
 
       # ============================================================
-      # 7. 清理历史运行
+      # 10. 清理历史运行
       # ============================================================
       - name: 🧹 清理历史运行记录
         if: always()
@@ -357,26 +1043,55 @@ jobs:
 
           REPO="${{ github.repository }}"
 
-          echo "==== 清理失败 / 取消的运行记录 ===="
+          echo "============================================================"
+          echo "清理失败 / 取消的运行记录"
+          echo "============================================================"
 
-          gh api "repos/${REPO}/actions/runs" \
+          gh api \
+            "repos/${REPO}/actions/runs" \
             --paginate \
-            -q '.workflow_runs[]
-                | select(.conclusion=="failure" or .conclusion=="cancelled")
-                | .id' |
+            -q '
+              .workflow_runs[]
+              | select(
+                  .conclusion=="failure"
+                  or
+                  .conclusion=="cancelled"
+                )
+              | .id
+            ' |
           xargs -r -I {} \
-            gh api -X DELETE "repos/${REPO}/actions/runs/{}"
+            gh api \
+              -X DELETE \
+              "repos/${REPO}/actions/runs/{}"
 
-          echo "==== 清理 3 天以前的成功记录 ===="
+          echo ""
+          echo "============================================================"
+          echo "清理 3 天以前的成功记录"
+          echo "============================================================"
 
-          CUTOFF=$(date -d "3 days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+          CUTOFF=$(date \
+            -d "3 days ago" \
+            -u \
+            +"%Y-%m-%dT%H:%M:%SZ")
 
-          gh api "repos/${REPO}/actions/runs" \
+          gh api \
+            "repos/${REPO}/actions/runs" \
             --paginate \
-            -q '.workflow_runs[]
-                | select(.conclusion=="success" and .created_at < "'"$CUTOFF"'")
-                | .id' |
+            -q '
+              .workflow_runs[]
+              | select(
+                  .conclusion=="success"
+                  and
+                  .created_at < "'"$CUTOFF"'"
+                )
+              | .id
+            ' |
           xargs -r -I {} \
-            gh api -X DELETE "repos/${REPO}/actions/runs/{}"
+            gh api \
+              -X DELETE \
+              "repos/${REPO}/actions/runs/{}"
 
-          echo "==== 清理完成 ===="
+          echo ""
+          echo "============================================================"
+          echo "清理完成"
+          echo "============================================================"
