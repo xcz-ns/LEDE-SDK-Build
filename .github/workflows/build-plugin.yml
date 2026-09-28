@@ -141,12 +141,12 @@ jobs:
           fi
 
           # tree 存在则输出文件树；--filelimit=N：目录条目超过 N 时折叠为 [N]
-          # 注意：选项值用空格分隔（部分 tree 版本不接受 --opt=value 形式，会直接退出 2）
+          # 注意：tree 2.0+ 即使正常输出也可能返回非零退出码（符号链接等边缘情况），
+          # 因此不以退出码判断成败，只看输出文件是否有内容
           if command -v tree >/dev/null 2>&1; then
-            tree -L "${TREE_MAX_DEPTH}" --filelimit "${TREE_FILE_LIMIT}" "${SDK_DIR}" > "${OUT}" 2>/tmp/tree_err.txt
-            rc=$?
-            if [[ $rc -ne 0 ]]; then
-              echo "::warning::tree 退出码 ${rc}，错误输出："
+            tree -L "${TREE_MAX_DEPTH}" --filelimit "${TREE_FILE_LIMIT}" "${SDK_DIR}" > "${OUT}" 2>/tmp/tree_err.txt || true
+            if [[ ! -s "${OUT}" ]]; then
+              echo "::warning::tree 未生成输出，错误："
               cat /tmp/tree_err.txt
             fi
           fi
@@ -271,13 +271,15 @@ jobs:
 
             echo "=> 锁定路径: ${TARGET}"
             echo "::group::🔨 ${name} 编译日志"
-            if make "${TARGET}/compile" -j"$(nproc)"; then
+            # 关键：命令行传 CONFIG_PACKAGE_<name>=y 强制选中该包，
+            # 否则 OpenWrt 因 .config 未选中而跳过打包（编译"成功"但不产出 ipk）
+            if make "${TARGET}/compile" -j"$(nproc)" "CONFIG_PACKAGE_${name}=y"; then
               echo "::notice::${name} 编译成功"
               BUILT_OK+=("${name}")
             else
               # 失败时单线程重跑以获得完整错误日志
               echo "::warning::${name} 多线程编译失败，单线程重试（V=s）"
-              make "${TARGET}/compile" -j1 V=s
+              make "${TARGET}/compile" -j1 V=s "CONFIG_PACKAGE_${name}=y"
             fi
             echo "::endgroup::"
           done
