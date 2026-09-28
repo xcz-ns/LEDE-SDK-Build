@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       firmware_repo:
-        description: "插件源码仓库地址（支持 https://github.com/a/b、git@github.com:a/b.git、a/b 三种写法）"
+        description: "插件源码仓库地址"
         required: true
         type: string
       architecture:
@@ -20,7 +20,6 @@ on:
         required: true
         type: string
 
-# 最小权限：contents 只读 + actions 写（清理历史 runs 所需）
 permissions:
   contents: read
   actions: write
@@ -241,12 +240,6 @@ jobs:
           # sed 把 SDK 平台默认选中的用户包全部显式禁用，
           # 编译时通过 CONFIG_PACKAGE_<name>=y 按需拉目标插件及其依赖，跳过无关包
           sed -i -E 's/^(CONFIG_PACKAGE_[A-Za-z0-9_.-]+)=y$/# \1 is not set/' .config
-          # 必须显式保留 openssl TLS 栈，否则 ustream-ssl 会误选 mbedtls 变体导致编译失败
-          printf '%s\n' \
-            'CONFIG_PACKAGE_libustream-openssl=y' \
-            'CONFIG_PACKAGE_libopenssl=y' >> .config
-          # 不再跑第二次 defconfig：.config 已完整，make 编译时自动处理依赖，省一步
-
           echo "✅ 配置生成完毕（仅按需编译目标插件及其依赖）"
           PKG_COUNT=$(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.-]+=y' .config || true)
           echo "当前 .config 中显式选中的包数: ${PKG_COUNT}（编译时会按需追加目标插件及其依赖）"
