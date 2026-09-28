@@ -125,56 +125,50 @@ jobs:
       - name: 🌳 输出 SDK 文件树（超限目录折叠/截断）
         shell: bash
         run: |
-          set -uo pipefail
+          # 注意：Actions 对 bash 默认带 errexit(-e)；本步骤是信息展示，必须显式关闭
+          set -u -o pipefail
+          set +e
           SDK_DIR="${{ env.SDK_DIR }}"
           OUT=/tmp/sdk_tree.txt
 
-          # 优先使用 tree 命令；--filelimit=N：目录条目数超过 N 时折叠为 [N]，不再展开
+          echo "SDK_DIR=${SDK_DIR}"
+          echo "tree: $(command -v tree || echo '未安装，尝试安装')"
+
+          # 没有 tree 就尝试安装
+          if ! command -v tree >/dev/null 2>&1; then
+            sudo apt-get update -qq >/dev/null 2>&1
+            sudo apt-get install -y -qq tree >/dev/null 2>&1
+          fi
+
+          # tree 存在则输出文件树；--filelimit=N：目录条目超过 N 时折叠为 [N]
+          # 注意：选项值用空格分隔（部分 tree 版本不接受 --opt=value 形式，会直接退出 2）
           if command -v tree >/dev/null 2>&1; then
-            tree -L "${TREE_MAX_DEPTH}" --filelimit="${TREE_FILE_LIMIT}" "${SDK_DIR}" > "${OUT}"
-          else
-            # tree 不可用：尝试安装，仍失败则使用内置 bash 函数降级
-            sudo apt-get update -qq >/dev/null 2>&1 || true
-            sudo apt-get install -y -qq tree >/dev/null 2>&1 || true
-            if command -v tree >/dev/null 2>&1; then
-              tree -L "${TREE_MAX_DEPTH}" --filelimit="${TREE_FILE_LIMIT}" "${SDK_DIR}" > "${OUT}"
-            else
-              echo "::warning::tree 安装失败，使用内置降级文件树"
-              # 降级实现：每个目录最多列出前 ${TREE_FILE_LIMIT} 项，超出部分标注省略
-              tree_limited() {
-                local dir="$1" prefix="$2" depth="$3" item base
-                local -a items=()
-                local total=0
-                (( depth <= 0 )) && { echo "${prefix}└── …（达到最大深度）"; return; }
-                while IFS= read -r -d '' item; do items+=("$item"); done \
-                  < <(find "${dir}" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | sort -z)
-                total=${#items[@]}
-                for item in "${items[@]:0:${TREE_FILE_LIMIT}}"; do
-                  base=$(basename "${item}")
-                  if [[ -d "${item}" && ! -L "${item}" ]]; then
-                    echo "${prefix}├── ${base}/"
-                    tree_limited "${item}" "${prefix}    " "$((depth-1))"
-                  else
-                    echo "${prefix}├── ${base}"
-                  fi
-                done
-                if (( total > TREE_FILE_LIMIT )); then
-                  echo "${prefix}└── …（共 ${total} 项，仅列前 ${TREE_FILE_LIMIT} 项）"
-                fi
-              }
-              tree_limited "${SDK_DIR}" "" "${TREE_MAX_DEPTH}" > "${OUT}"
+            tree -L "${TREE_MAX_DEPTH}" --filelimit "${TREE_FILE_LIMIT}" "${SDK_DIR}" > "${OUT}" 2>/tmp/tree_err.txt
+            rc=$?
+            if [[ $rc -ne 0 ]]; then
+              echo "::warning::tree 退出码 ${rc}，错误输出："
+              cat /tmp/tree_err.txt
             fi
+          fi
+
+          # tree 不可用或失败时，用 find 兜底，保证文件树不空白
+          if [[ ! -s "${OUT}" ]]; then
+            echo "::notice::tree 不可用，使用 find 兜底输出"
+            find "${SDK_DIR}" -maxdepth "${TREE_MAX_DEPTH}" -print > "${OUT}" 2>/dev/null
           fi
 
           # 同时输出到构建日志和运行页 Step Summary
           echo "===== SDK 文件树 ====="
-          cat "${OUT}"
+          cat "${OUT}" || true
           {
             echo "### 🌳 SDK 文件树"
             echo '```text'
             cat "${OUT}"
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+          # 信息展示步骤永远不阻断构建
+          exit 0
 
       # ==================== 步骤 3：引入插件源码 ====================
       - name: 📂 引入第三方插件源码
@@ -303,10 +297,12 @@ jobs:
       - name: 📤 统计编译产物
         shell: bash
         run: |
-          set -uo pipefail
+          # 信息展示步骤：关闭 errexit，不统计失败就阻断构建
+          set -u -o pipefail
+          set +e
           cd "${SDK_DIR}"
           IPK_LIST=$(find bin -name '*.ipk' 2>/dev/null | sort)
-          IPK_COUNT=$(printf '%s' "${IPK_LIST}" | grep -c . || true)
+          IPK_COUNT=$(printf '%s' "${IPK_LIST}" | grep -c .)
           echo "IPK_COUNT=${IPK_COUNT}" >> "$GITHUB_ENV"
 
           {
@@ -318,7 +314,9 @@ jobs:
               echo "（未找到任何 .ipk 产物）"
             fi
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+          exit 0
 
       # ==================== 步骤 8：上传产物 ====================
       - name: ⬆️ 上传 ipk 产物
