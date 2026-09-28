@@ -230,13 +230,22 @@ jobs:
         run: |
           set -euo pipefail
           cd "${SDK_DIR}"
-          # 关闭"默认全量编译"，只编译显式指定的插件，大幅缩短构建时间
+          # 关闭"默认全量编译"
           printf '%s\n' \
             '# CONFIG_ALL is not set' \
             '# CONFIG_ALL_KMODS is not set' \
             '# CONFIG_ALL_NONSHARED is not set' > .config
           make defconfig
-          echo "✅ 配置生成完毕"
+
+          # defconfig 会选中 SDK 平台默认包（linux-firmware、luci-proto-ppp、无关 kmod 等）；
+          # 这里把所有 CONFIG_PACKAGE_*=y 显式关掉，只保留编译时通过 CONFIG_PACKAGE_<name>=y
+          # 显式指定的包——OpenWrt 依赖解析会自动拉回目标插件真正需要的依赖，跳过无关包，大幅加快速度
+          sed -i -E 's/^(CONFIG_PACKAGE_[A-Za-z0-9_.-]+)=y$/# \1 is not set/' .config
+          make defconfig
+
+          echo "✅ 配置生成完毕（仅按需编译目标插件及其依赖）"
+          PKG_COUNT=$(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.-]+=y' .config || true)
+          echo "当前 .config 中显式选中的包数: ${PKG_COUNT}（编译时会按需追加目标插件及其依赖）"
           grep -E '^CONFIG_TARGET_(BOARD|ARCH|SUBTARGET)' .config | head -5 || true
 
       # ==================== 步骤 6：编译 ====================
